@@ -598,7 +598,7 @@ FILE_MANAGER_HTML = """
                 // 限制预览大小
                 let content = data.content;
                 if (content.length > 50000) {
-                    content = content.substring(0, 50000) + '\n\n... (内容过长，已截断)';
+                    content = content.substring(0, 50000) + '\\n\\n... (内容过长，已截断)';
                 }
                 
                 previewEl.innerHTML = `<pre>${escapeHtml(content)}</pre>`;
@@ -608,7 +608,7 @@ FILE_MANAGER_HTML = """
         }
         
         async function deleteItem(path) {
-            if (!confirm(`确定删除?\n${path}`)) return;
+            if (!confirm('确定删除?\\n' + path)) return;
             
             try {
                 const res = await fetchAPI(`/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
