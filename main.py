@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import subprocess
@@ -244,6 +244,36 @@ def delete_path(path: str):
         return {"status": "success", "deleted": full_path}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload", dependencies=[Depends(verify_token)])
+async def upload_file(file: UploadFile = File(...), subdir: str = Form("")):
+    """接收二进制文件上传，写入 workspace 的指定子目录"""
+    try:
+        # 确定目标目录
+        if subdir:
+            target_dir = os.path.join(WORKSPACE, subdir)
+        else:
+            target_dir = WORKSPACE
+        os.makedirs(target_dir, exist_ok=True)
+
+        # 安全文件名：保留原名，冲突时追加序号
+        filename = file.filename or "uploaded_file"
+        target_path = os.path.join(target_dir, filename)
+        if os.path.exists(target_path):
+            name, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(target_path):
+                target_path = os.path.join(target_dir, f"{name}_{counter}{ext}")
+                counter += 1
+
+        content = await file.read()
+        with open(target_path, "wb") as f:
+            f.write(content)
+
+        rel_path = os.path.relpath(target_path, WORKSPACE)
+        return {"path": rel_path, "size": len(content)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
