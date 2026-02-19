@@ -1,4 +1,10 @@
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import subprocess
+import os
+import shlex
+import shutil
 
 # 获取工作目录，默认为 /workspace
 WORKSPACE = os.environ.get("WORKSPACE_DIR", "/workspace")
