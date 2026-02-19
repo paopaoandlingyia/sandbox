@@ -1,16 +1,18 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import subprocess
-import os
-import shlex
-import shutil
-
-app = FastAPI(title="Minimalist AI Sandbox API")
+from fastapi.staticfiles import StaticFiles
 
 # 获取工作目录，默认为 /workspace
 WORKSPACE = os.environ.get("WORKSPACE_DIR", "/workspace")
 if not os.path.exists(WORKSPACE):
     os.makedirs(WORKSPACE, exist_ok=True)
+
+# 确保公共映射目录存在
+PUBLIC_DIR = os.path.join(WORKSPACE, "public")
+os.makedirs(PUBLIC_DIR, exist_ok=True)
+
+app = FastAPI(title="Minimalist AI Sandbox API")
+
+# 挂载静态目录到 /public 路径
+app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
 
 # 安全认证：从环境变量获取 Token，默认为 "insecure-default-token"
 # 强烈建议在部署时设置环境变量 SANDBOX_TOKEN
