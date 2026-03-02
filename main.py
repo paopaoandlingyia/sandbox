@@ -11,14 +11,11 @@ WORKSPACE = os.environ.get("WORKSPACE_DIR", "/workspace")
 if not os.path.exists(WORKSPACE):
     os.makedirs(WORKSPACE, exist_ok=True)
 
-# 确保公共映射目录存在
-PUBLIC_DIR = os.path.join(WORKSPACE, "public")
-os.makedirs(PUBLIC_DIR, exist_ok=True)
-
+STATIC_DIR = WORKSPACE
+os.makedirs(STATIC_DIR, exist_ok=True)
 app = FastAPI(title="Minimalist AI Sandbox API")
-
-# 挂载静态目录到 /public 路径
-app.mount("/public", StaticFiles(directory=PUBLIC_DIR), name="public")
+# 挂载静态目录到 /workspace 路径
+app.mount("/workspace", StaticFiles(directory=STATIC_DIR), name="workspace")
 
 # 安全认证：从环境变量获取 Token，默认为 "insecure-default-token"
 # 强烈建议在部署时设置环境变量 SANDBOX_TOKEN
@@ -692,3 +689,4 @@ FILE_MANAGER_HTML = """
 def file_manager_ui():
     """文件管理 WebUI（使用 SANDBOX_TOKEN 鉴权）"""
     return FILE_MANAGER_HTML
+
