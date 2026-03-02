@@ -14,8 +14,6 @@ if not os.path.exists(WORKSPACE):
 STATIC_DIR = WORKSPACE
 os.makedirs(STATIC_DIR, exist_ok=True)
 app = FastAPI(title="Minimalist AI Sandbox API")
-# 挂载静态目录到 / 路径，API 路由享有更高优先级，不冲突
-app.mount("/", StaticFiles(directory=STATIC_DIR), name="static")
 
 # 安全认证：从环境变量获取 Token，默认为 "insecure-default-token"
 # 强烈建议在部署时设置环境变量 SANDBOX_TOKEN
@@ -689,3 +687,7 @@ FILE_MANAGER_HTML = """
 def file_manager_ui():
     """文件管理 WebUI（使用 SANDBOX_TOKEN 鉴权）"""
     return FILE_MANAGER_HTML
+
+# 必须放在最后：挂载静态目录到 / 路径
+app.mount("/", StaticFiles(directory=STATIC_DIR), name="static")
+
