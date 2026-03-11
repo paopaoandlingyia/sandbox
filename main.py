@@ -160,7 +160,8 @@ def write_file(req: WriteFileRequest):
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(req.content)
             
-        return {"status": "success", "path": full_path}
+        rel_path = os.path.relpath(full_path, WORKSPACE)
+        return {"status": "success", "path": rel_path}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
