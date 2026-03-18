@@ -1,29 +1,216 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-import subprocess
+import contextlib
+import json
 import os
-import shlex
 import shutil
+import subprocess
+import uuid
 
-# 获取工作目录，默认为 /workspace
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Header, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastmcp import FastMCP
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+# ===================== 配置 =====================
+
 WORKSPACE = os.environ.get("WORKSPACE_DIR", "/workspace")
-if not os.path.exists(WORKSPACE):
-    os.makedirs(WORKSPACE, exist_ok=True)
+os.makedirs(WORKSPACE, exist_ok=True)
 
-STATIC_DIR = WORKSPACE
-os.makedirs(STATIC_DIR, exist_ok=True)
-app = FastAPI(title="Minimalist AI Sandbox API")
-
-# 安全认证：从环境变量获取 Token，默认为 "insecure-default-token"
-# 强烈建议在部署时设置环境变量 SANDBOX_TOKEN
 SANDBOX_TOKEN = os.environ.get("SANDBOX_TOKEN", "123456")
 
-from fastapi import Header, Depends
+LANGUAGE_RUNNERS = {
+    "python": "python3", "python3": "python3", "py": "python3",
+    "bash": "bash", "sh": "sh",
+    "node": "node", "javascript": "node", "js": "node",
+}
+
+LANGUAGE_EXTENSIONS = {
+    "python": ".py", "python3": ".py", "py": ".py",
+    "bash": ".sh", "sh": ".sh",
+    "node": ".js", "javascript": ".js", "js": ".js",
+}
+
+# ===================== 核心逻辑（框架无关）=====================
+
+def core_execute_command(command: str, timeout: int = 30) -> dict:
+    """执行 shell 命令"""
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=WORKSPACE,
+            capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
+        )
+        return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.returncode}
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Command timed out", "exit_code": -1}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "exit_code": -1}
+
+
+def core_run_code(language: str, code: str, timeout: int = 30) -> dict:
+    """写入临时文件并执行代码"""
+    lang = language.lower()
+    if lang not in LANGUAGE_RUNNERS:
+        return {
+            "stdout": "",
+            "stderr": f"Unsupported language: {language}. Supported: {list(LANGUAGE_RUNNERS.keys())}",
+            "exit_code": -1,
+        }
+
+    runner = LANGUAGE_RUNNERS[lang]
+    ext = LANGUAGE_EXTENSIONS[lang]
+    temp_filename = f"_run_{uuid.uuid4().hex[:8]}{ext}"
+    temp_path = os.path.join(WORKSPACE, temp_filename)
+
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        result = subprocess.run(
+            f"{runner} {temp_filename}", shell=True, cwd=WORKSPACE,
+            capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
+        )
+        return {
+            "stdout": result.stdout, "stderr": result.stderr,
+            "exit_code": result.returncode, "temp_file": temp_filename,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "Code execution timed out", "exit_code": -1}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "exit_code": -1}
+
+
+def core_write_file(path: str, content: str) -> dict:
+    """写入文件"""
+    try:
+        full_path = path if os.path.isabs(path) else os.path.join(WORKSPACE, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {"status": "success", "path": os.path.relpath(full_path, WORKSPACE)}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def core_read_file(path: str) -> dict:
+    """读取文件"""
+    try:
+        full_path = path if os.path.isabs(path) else os.path.join(WORKSPACE, path)
+        if not os.path.exists(full_path):
+            return {"content": None, "error": "File not found"}
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            return {"content": f.read()}
+    except Exception as e:
+        return {"content": None, "error": str(e)}
+
+
+# ===================== MCP 层 =====================
+
+mcp = FastMCP(
+    name="Cloud Sandbox",
+    instructions=(
+        "一个运行在 Docker 容器中的云端沙盒环境。"
+        "你拥有完整的 Linux 环境权限，可以执行命令、运行代码、读写文件。"
+        "工作目录为 /workspace。已预装 Python3、Node.js、常用系统工具。"
+    ),
+    stateless_http=True,
+)
+
+
+@mcp.tool
+def execute_command(command: str, timeout: int = 30) -> str:
+    """在沙盒中执行 shell 命令。
+
+    可以执行任意 Linux 命令，如 ls、pip install、curl、git 等。
+    工作目录为 /workspace。
+
+    Args:
+        command: 要执行的 shell 命令
+        timeout: 超时时间（秒），默认 30
+    """
+    result = core_execute_command(command, timeout)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool
+def run_code(language: str, code: str, timeout: int = 30) -> str:
+    """在沙盒中执行代码片段。
+
+    自动创建临时文件并执行，无需手动写文件。
+    支持的语言: python, bash, node (javascript)
+
+    Args:
+        language: 编程语言 (python/bash/node)
+        code: 要执行的代码内容
+        timeout: 超时时间（秒），默认 30
+    """
+    result = core_run_code(language, code, timeout)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool
+def write_file(path: str, content: str) -> str:
+    """将内容写入沙盒中的文件。
+
+    支持相对路径（相对于 /workspace）和绝对路径。
+    自动创建不存在的父目录。
+
+    Args:
+        path: 文件路径（相对于 /workspace 或绝对路径）
+        content: 要写入的文件内容
+    """
+    result = core_write_file(path, content)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool
+def read_file(path: str) -> str:
+    """读取沙盒中的文件内容。
+
+    支持相对路径（相对于 /workspace）和绝对路径。
+
+    Args:
+        path: 文件路径（相对于 /workspace 或绝对路径）
+    """
+    result = core_read_file(path)
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ===================== FastAPI + MCP 挂载 =====================
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with contextlib.AsyncExitStack() as stack:
+        await stack.enter_async_context(mcp.session_manager.run())
+        yield
+
+app = FastAPI(title="AI Sandbox", lifespan=lifespan)
+
+
+# MCP 认证中间件：拦截 /mcp 路径的请求
+class MCPAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith("/mcp"):
+            token = request.headers.get("x-sandbox-token")
+            if token != SANDBOX_TOKEN:
+                return JSONResponse(status_code=403, content={"detail": "Invalid X-Sandbox-Token"})
+        return await call_next(request)
+
+app.add_middleware(MCPAuthMiddleware)
+
+# 挂载 MCP Streamable HTTP 端点
+app.mount("/mcp", mcp.streamable_http_app())
+
+
+# ===================== REST API（机器人插件兼容）=====================
 
 async def verify_token(x_sandbox_token: str = Header(None)):
     if x_sandbox_token != SANDBOX_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid X-Sandbox-Token")
+
 
 class ExecuteRequest(BaseModel):
     command: str
@@ -34,172 +221,63 @@ class WriteFileRequest(BaseModel):
     content: str
 
 class RunCodeRequest(BaseModel):
-    language: str = "python"  # python, bash, node, etc.
+    language: str = "python"
     code: str
     timeout: int = 30
 
+
 @app.get("/")
 def read_root():
-    return {"status": "online", "workspace": WORKSPACE, "auth_enabled": True}
+    return {"status": "online", "workspace": WORKSPACE, "auth_enabled": True, "mcp_endpoint": "/mcp"}
 
-# 语言到执行命令的映射
-LANGUAGE_RUNNERS = {
-    "python": "python3",
-    "python3": "python3",
-    "py": "python3",
-    "bash": "bash",
-    "sh": "sh",
-    "node": "node",
-    "javascript": "node",
-    "js": "node",
-}
-
-# 语言到文件扩展名的映射
-LANGUAGE_EXTENSIONS = {
-    "python": ".py",
-    "python3": ".py",
-    "py": ".py",
-    "bash": ".sh",
-    "sh": ".sh",
-    "node": ".js",
-    "javascript": ".js",
-    "js": ".js",
-}
-
-@app.post("/run_code", dependencies=[Depends(verify_token)])
-def run_code(req: RunCodeRequest):
-    """一站式代码执行：自动写入临时文件并执行"""
-    lang = req.language.lower()
-    
-    if lang not in LANGUAGE_RUNNERS:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported language: {req.language}. Supported: {list(LANGUAGE_RUNNERS.keys())}"
-        )
-    
-    runner = LANGUAGE_RUNNERS[lang]
-    ext = LANGUAGE_EXTENSIONS[lang]
-    
-    # 创建临时文件
-    import uuid
-    temp_filename = f"_run_{uuid.uuid4().hex[:8]}{ext}"
-    temp_path = os.path.join(WORKSPACE, temp_filename)
-    
-    try:
-        # 写入代码
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(req.code)
-        
-        # 执行代码
-        result = subprocess.run(
-            f"{runner} {temp_filename}",
-            shell=True,
-            cwd=WORKSPACE,
-            capture_output=True,
-            text=True,
-            timeout=req.timeout,
-            encoding='utf-8',
-            errors='replace'
-        )
-        
-        return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.returncode,
-            "temp_file": temp_filename
-        }
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="Code execution timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # 清理临时文件（可选，保留以便调试）
-        # if os.path.exists(temp_path):
-        #     os.remove(temp_path)
-        pass
 
 @app.post("/execute", dependencies=[Depends(verify_token)])
-def execute(req: ExecuteRequest):
-    try:
-        # 执行 shell 命令
-        # 我们直接在 WORKSPACE 目录下执行
-        result = subprocess.run(
-            req.command,
-            shell=True,
-            cwd=WORKSPACE,
-            capture_output=True,
-            text=True,
-            timeout=req.timeout,
-            encoding='utf-8',  # 强制使用 utf-8
-            errors='replace'   # 防止编码错误导致 crash
-        )
-        return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.returncode
-        }
-    except subprocess.TimeoutExpired:
+def api_execute(req: ExecuteRequest):
+    result = core_execute_command(req.command, req.timeout)
+    if result["exit_code"] == -1 and "timed out" in result["stderr"]:
         raise HTTPException(status_code=408, detail="Command timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return result
+
+
+@app.post("/run_code", dependencies=[Depends(verify_token)])
+def api_run_code(req: RunCodeRequest):
+    result = core_run_code(req.language, req.code, req.timeout)
+    if result["exit_code"] == -1 and "Unsupported language" in result["stderr"]:
+        raise HTTPException(status_code=400, detail=result["stderr"])
+    if result["exit_code"] == -1 and "timed out" in result["stderr"]:
+        raise HTTPException(status_code=408, detail="Code execution timed out")
+    return result
+
 
 @app.post("/write", dependencies=[Depends(verify_token)])
-def write_file(req: WriteFileRequest):
-    try:
-        # 允许访问任意路径：只要是容器内的路径均可
-        # 如果 path 是绝对路径，os.path.join 会直接使用该绝对路径
-        # 如果 path 是相对路径，则相对于 WORKSPACE
-        if os.path.isabs(req.path):
-            full_path = req.path
-        else:
-            full_path = os.path.join(WORKSPACE, req.path)
-        
-        # 自动创建父目录
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        
-        with open(full_path, "w", encoding="utf-8") as f:
-            f.write(req.content)
-            
-        rel_path = os.path.relpath(full_path, WORKSPACE)
-        return {"status": "success", "path": rel_path}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def api_write_file(req: WriteFileRequest):
+    result = core_write_file(req.path, req.content)
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["detail"])
+    return result
+
 
 @app.get("/read", dependencies=[Depends(verify_token)])
-def read_file(path: str):
-    try:
-        if os.path.isabs(path):
-            full_path = path
-        else:
-            full_path = os.path.join(WORKSPACE, path)
-            
-        if not os.path.exists(full_path):
-            raise HTTPException(status_code=404, detail="File not found")
-            
-        with open(full_path, "r", encoding="utf-8", errors='replace') as f:
-            content = f.read()
-            
-        return {"content": content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def api_read_file(path: str):
+    result = core_read_file(path)
+    if result.get("error"):
+        status = 404 if result["error"] == "File not found" else 500
+        raise HTTPException(status_code=status, detail=result["error"])
+    return result
 
-# ===================== 新增功能 =====================
+
+# ===================== WebUI 专用端点 =====================
 
 @app.get("/list", dependencies=[Depends(verify_token)])
 def list_dir(path: str = "."):
-    """列出目录内容，返回结构化 JSON"""
+    """列出目录内容"""
     try:
-        if os.path.isabs(path):
-            full_path = path
-        else:
-            full_path = os.path.join(WORKSPACE, path)
-        
+        full_path = path if os.path.isabs(path) else os.path.join(WORKSPACE, path)
         if not os.path.exists(full_path):
             raise HTTPException(status_code=404, detail="Path not found")
-        
         if not os.path.isdir(full_path):
             raise HTTPException(status_code=400, detail="Path is not a directory")
-        
+
         items = []
         for name in os.listdir(full_path):
             item_path = os.path.join(full_path, name)
@@ -208,53 +286,41 @@ def list_dir(path: str = "."):
                 "name": name,
                 "type": "dir" if os.path.isdir(item_path) else "file",
                 "size": stat.st_size,
-                "modified": stat.st_mtime
+                "modified": stat.st_mtime,
             })
-        
-        # 按类型和名称排序：目录在前，文件在后
         items.sort(key=lambda x: (0 if x["type"] == "dir" else 1, x["name"].lower()))
-        
         return {"path": full_path, "items": items}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.delete("/delete", dependencies=[Depends(verify_token)])
 def delete_path(path: str):
     """删除文件或目录"""
     try:
-        if os.path.isabs(path):
-            full_path = path
-        else:
-            full_path = os.path.join(WORKSPACE, path)
-        
+        full_path = path if os.path.isabs(path) else os.path.join(WORKSPACE, path)
         if not os.path.exists(full_path):
             raise HTTPException(status_code=404, detail="Path not found")
-        
         if os.path.isdir(full_path):
             shutil.rmtree(full_path)
         else:
             os.remove(full_path)
-        
         return {"status": "success", "deleted": full_path}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/upload", dependencies=[Depends(verify_token)])
 async def upload_file(file: UploadFile = File(...), subdir: str = Form("")):
-    """接收二进制文件上传，写入 workspace 的指定子目录"""
+    """接收二进制文件上传"""
     try:
-        # 确定目标目录
-        if subdir:
-            target_dir = os.path.join(WORKSPACE, subdir)
-        else:
-            target_dir = WORKSPACE
+        target_dir = os.path.join(WORKSPACE, subdir) if subdir else WORKSPACE
         os.makedirs(target_dir, exist_ok=True)
 
-        # 安全文件名：保留原名，冲突时追加序号
         filename = file.filename or "uploaded_file"
         target_path = os.path.join(target_dir, filename)
         if os.path.exists(target_path):
@@ -273,9 +339,8 @@ async def upload_file(file: UploadFile = File(...), subdir: str = Form("")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ===================== 文件管理 WebUI =====================
 
-from fastapi.responses import HTMLResponse
+# ===================== 文件管理 WebUI =====================
 
 FILE_MANAGER_HTML = """
 <!DOCTYPE html>
@@ -294,8 +359,6 @@ FILE_MANAGER_HTML = """
             padding: 20px;
         }
         .container { max-width: 1200px; margin: 0 auto; }
-        
-        /* 登录界面 */
         .login-box {
             background: rgba(255,255,255,0.05);
             backdrop-filter: blur(10px);
@@ -332,8 +395,6 @@ FILE_MANAGER_HTML = """
             transform: translateY(-2px);
             box-shadow: 0 8px 25px rgba(59,130,246,0.3);
         }
-        
-        /* 主界面 */
         .main-ui { display: none; }
         .header {
             display: flex;
@@ -350,7 +411,6 @@ FILE_MANAGER_HTML = """
             color: #f87171;
             cursor: pointer;
         }
-        
         .breadcrumb {
             display: flex;
             gap: 8px;
@@ -364,14 +424,12 @@ FILE_MANAGER_HTML = """
         .breadcrumb span { color: #9ca3af; }
         .breadcrumb a { color: #60a5fa; text-decoration: none; cursor: pointer; }
         .breadcrumb a:hover { text-decoration: underline; }
-        
         .panel {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
         }
         @media (max-width: 900px) { .panel { grid-template-columns: 1fr; } }
-        
         .file-list, .preview-panel {
             background: rgba(255,255,255,0.03);
             border: 1px solid rgba(255,255,255,0.08);
@@ -384,7 +442,6 @@ FILE_MANAGER_HTML = """
             border-bottom: 1px solid rgba(255,255,255,0.08);
             font-weight: 600;
         }
-        
         .file-item {
             display: flex;
             align-items: center;
@@ -409,7 +466,6 @@ FILE_MANAGER_HTML = """
         }
         .file-actions button:hover { opacity: 0.8; }
         .btn-delete { background: #dc2626; color: #fff; }
-        
         .preview-content {
             padding: 16px;
             max-height: 500px;
@@ -431,60 +487,48 @@ FILE_MANAGER_HTML = """
             text-align: center;
             padding: 40px;
         }
-        
         .loading { text-align: center; padding: 40px; color: #6b7280; }
         .error { color: #f87171; padding: 16px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- 登录界面 -->
         <div id="login-ui" class="login-box">
-            <h2>🔐 Sandbox 文件管理</h2>
-            <input type="password" id="token-input" placeholder="输入访问密钥..." onkeydown="if(event.key==='Enter')login()">
-            <button onclick="login()">验证登录</button>
+            <h2>Sandbox File Manager</h2>
+            <input type="password" id="token-input" placeholder="Enter access token..." onkeydown="if(event.key==='Enter')login()">
+            <button onclick="login()">Login</button>
             <p id="login-error" style="color:#f87171;margin-top:12px;display:none;"></p>
         </div>
-        
-        <!-- 主界面 -->
         <div id="main-ui" class="main-ui">
             <div class="header">
-                <h1>📁 Sandbox File Manager</h1>
-                <button class="logout-btn" onclick="logout()">退出登录</button>
+                <h1>Sandbox File Manager</h1>
+                <button class="logout-btn" onclick="logout()">Logout</button>
             </div>
-            
             <div class="breadcrumb" id="breadcrumb"></div>
-            
             <div class="panel">
                 <div class="file-list">
-                    <div class="panel-header">文件列表</div>
+                    <div class="panel-header">Files</div>
                     <div id="file-list-content"></div>
                 </div>
                 <div class="preview-panel">
-                    <div class="panel-header">文件预览</div>
+                    <div class="panel-header">Preview</div>
                     <div class="preview-content" id="preview-content">
-                        <div class="preview-placeholder">选择文件以预览内容</div>
+                        <div class="preview-placeholder">Select a file to preview</div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
-    
     <script>
         let TOKEN = localStorage.getItem('sandbox_token') || '';
         let currentPath = '/workspace';
-        
-        // 初始化
-        if (TOKEN) {
-            verifyAndEnter();
-        }
-        
+        if (TOKEN) { verifyAndEnter(); }
+
         async function login() {
             TOKEN = document.getElementById('token-input').value;
             if (!TOKEN) return;
             await verifyAndEnter();
         }
-        
         async function verifyAndEnter() {
             try {
                 const res = await fetchAPI('/list?path=/workspace');
@@ -493,192 +537,95 @@ FILE_MANAGER_HTML = """
                     document.getElementById('login-ui').style.display = 'none';
                     document.getElementById('main-ui').style.display = 'block';
                     loadDirectory('/workspace');
-                } else {
-                    showLoginError('密钥错误或服务不可用');
-                }
-            } catch (e) {
-                showLoginError('连接失败: ' + e.message);
-            }
+                } else { showLoginError('Invalid token or service unavailable'); }
+            } catch (e) { showLoginError('Connection failed: ' + e.message); }
         }
-        
         function showLoginError(msg) {
             const el = document.getElementById('login-error');
-            el.textContent = msg;
-            el.style.display = 'block';
+            el.textContent = msg; el.style.display = 'block';
         }
-        
-        function logout() {
-            localStorage.removeItem('sandbox_token');
-            TOKEN = '';
-            location.reload();
-        }
-        
+        function logout() { localStorage.removeItem('sandbox_token'); TOKEN = ''; location.reload(); }
         async function fetchAPI(endpoint, options = {}) {
-            return fetch(endpoint, {
-                ...options,
-                headers: {
-                    'X-Sandbox-Token': TOKEN,
-                    'Content-Type': 'application/json',
-                    ...options.headers
-                }
-            });
+            return fetch(endpoint, { ...options, headers: { 'X-Sandbox-Token': TOKEN, 'Content-Type': 'application/json', ...options.headers } });
         }
-        
         async function loadDirectory(path) {
-            currentPath = path;
-            updateBreadcrumb();
-            
+            currentPath = path; updateBreadcrumb();
             const listEl = document.getElementById('file-list-content');
-            listEl.innerHTML = '<div class="loading">加载中...</div>';
-            
+            listEl.innerHTML = '<div class="loading">Loading...</div>';
             try {
                 const res = await fetchAPI(`/list?path=${encodeURIComponent(path)}`);
                 const data = await res.json();
-                
-                if (!res.ok) {
-                    listEl.innerHTML = `<div class="error">${data.detail || '加载失败'}</div>`;
-                    return;
-                }
-                
-                if (data.items.length === 0) {
-                    listEl.innerHTML = '<div class="loading">目录为空</div>';
-                    return;
-                }
-                
-                // 如果不是根目录，添加返回上级
+                if (!res.ok) { listEl.innerHTML = `<div class="error">${data.detail || 'Load failed'}</div>`; return; }
+                if (data.items.length === 0) { listEl.innerHTML = '<div class="loading">Empty directory</div>'; return; }
                 let html = '';
                 if (path !== '/workspace' && path !== '/') {
-                    html += `<div class="file-item" onclick="goUp()">
-                        <span class="file-icon">⬆️</span>
-                        <span class="file-name">..</span>
-                    </div>`;
+                    html += `<div class="file-item" onclick="goUp()"><span class="file-icon">⬆️</span><span class="file-name">..</span></div>`;
                 }
-                
                 for (const item of data.items) {
                     const icon = item.type === 'dir' ? '📁' : getFileIcon(item.name);
                     const size = item.type === 'dir' ? '' : formatSize(item.size);
                     const itemPath = path + '/' + item.name;
-                    
                     html += `<div class="file-item" data-path="${escapeHtml(itemPath)}" data-type="${item.type}" onclick="handleItemClick(this)">
-                        <span class="file-icon">${icon}</span>
-                        <span class="file-name">${escapeHtml(item.name)}</span>
+                        <span class="file-icon">${icon}</span><span class="file-name">${escapeHtml(item.name)}</span>
                         <span class="file-size">${size}</span>
-                        <div class="file-actions">
-                            <button class="btn-delete" onclick="event.stopPropagation();deleteItem('${escapeHtml(itemPath)}')">删除</button>
-                        </div>
+                        <div class="file-actions"><button class="btn-delete" onclick="event.stopPropagation();deleteItem('${escapeHtml(itemPath)}')">Delete</button></div>
                     </div>`;
                 }
-                
                 listEl.innerHTML = html;
-            } catch (e) {
-                listEl.innerHTML = `<div class="error">请求失败: ${e.message}</div>`;
-            }
+            } catch (e) { listEl.innerHTML = `<div class="error">Request failed: ${e.message}</div>`; }
         }
-        
         function updateBreadcrumb() {
             const parts = currentPath.split('/').filter(p => p);
             let html = '<a onclick="loadDirectory(\'/\')">🏠</a>';
             let accPath = '';
-            
             for (let i = 0; i < parts.length; i++) {
                 accPath += '/' + parts[i];
-                const isLast = i === parts.length - 1;
                 html += '<span>/</span>';
-                if (isLast) {
-                    html += `<span>${escapeHtml(parts[i])}</span>`;
-                } else {
-                    html += `<a onclick="loadDirectory('${escapeHtml(accPath)}')">${escapeHtml(parts[i])}</a>`;
-                }
+                html += i === parts.length - 1 ? `<span>${escapeHtml(parts[i])}</span>` : `<a onclick="loadDirectory('${escapeHtml(accPath)}')">${escapeHtml(parts[i])}</a>`;
             }
-            
             document.getElementById('breadcrumb').innerHTML = html;
         }
-        
         function goUp() {
-            const parts = currentPath.split('/').filter(p => p);
-            parts.pop();
-            const parentPath = '/' + parts.join('/') || '/';
-            loadDirectory(parentPath);
+            const parts = currentPath.split('/').filter(p => p); parts.pop();
+            loadDirectory('/' + parts.join('/') || '/');
         }
-        
         async function handleItemClick(el) {
-            const path = el.dataset.path;
-            const type = el.dataset.type;
-            
-            // 移除其他选中状态
+            const path = el.dataset.path, type = el.dataset.type;
             document.querySelectorAll('.file-item.selected').forEach(e => e.classList.remove('selected'));
             el.classList.add('selected');
-            
-            if (type === 'dir') {
-                loadDirectory(path);
-            } else {
-                await previewFile(path);
-            }
+            if (type === 'dir') loadDirectory(path); else await previewFile(path);
         }
-        
         async function previewFile(path) {
             const previewEl = document.getElementById('preview-content');
-            previewEl.innerHTML = '<div class="loading">加载中...</div>';
-            
+            previewEl.innerHTML = '<div class="loading">Loading...</div>';
             try {
                 const res = await fetchAPI(`/read?path=${encodeURIComponent(path)}`);
                 const data = await res.json();
-                
-                if (!res.ok) {
-                    previewEl.innerHTML = `<div class="error">${data.detail || '读取失败'}</div>`;
-                    return;
-                }
-                
-                // 限制预览大小
+                if (!res.ok) { previewEl.innerHTML = `<div class="error">${data.detail || 'Read failed'}</div>`; return; }
                 let content = data.content;
-                if (content.length > 50000) {
-                    content = content.substring(0, 50000) + '\\n\\n... (内容过长，已截断)';
-                }
-                
+                if (content.length > 50000) content = content.substring(0, 50000) + '\\n\\n... (truncated)';
                 previewEl.innerHTML = `<pre>${escapeHtml(content)}</pre>`;
-            } catch (e) {
-                previewEl.innerHTML = `<div class="error">请求失败: ${e.message}</div>`;
-            }
+            } catch (e) { previewEl.innerHTML = `<div class="error">Request failed: ${e.message}</div>`; }
         }
-        
         async function deleteItem(path) {
-            if (!confirm('确定删除?\\n' + path)) return;
-            
+            if (!confirm('Delete?\\n' + path)) return;
             try {
                 const res = await fetchAPI(`/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
-                const data = await res.json();
-                
-                if (res.ok) {
-                    loadDirectory(currentPath);
-                    document.getElementById('preview-content').innerHTML = '<div class="preview-placeholder">文件已删除</div>';
-                } else {
-                    alert('删除失败: ' + (data.detail || '未知错误'));
-                }
-            } catch (e) {
-                alert('请求失败: ' + e.message);
-            }
+                if (res.ok) { loadDirectory(currentPath); document.getElementById('preview-content').innerHTML = '<div class="preview-placeholder">File deleted</div>'; }
+                else { const data = await res.json(); alert('Delete failed: ' + (data.detail || 'Unknown error')); }
+            } catch (e) { alert('Request failed: ' + e.message); }
         }
-        
         function getFileIcon(name) {
             const ext = name.split('.').pop().toLowerCase();
-            const icons = {
-                'py': '🐍', 'js': '📜', 'ts': '📘', 'json': '📋', 'md': '📝',
-                'txt': '📄', 'sh': '⚙️', 'html': '🌐', 'css': '🎨',
-                'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️',
-                'mp3': '🎵', 'wav': '🎵', 'mp4': '🎬', 'zip': '📦', 'tar': '📦'
-            };
+            const icons = { 'py':'🐍','js':'📜','ts':'📘','json':'📋','md':'📝','txt':'📄','sh':'⚙️','html':'🌐','css':'🎨','jpg':'🖼️','jpeg':'🖼️','png':'🖼️','gif':'🖼️','mp3':'🎵','wav':'🎵','mp4':'🎬','zip':'📦','tar':'📦' };
             return icons[ext] || '📄';
         }
-        
         function formatSize(bytes) {
             if (bytes < 1024) return bytes + ' B';
             if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
             return (bytes / 1024 / 1024).toFixed(1) + ' MB';
         }
-        
-        function escapeHtml(str) {
-            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-        }
+        function escapeHtml(str) { return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
     </script>
 </body>
 </html>
@@ -686,9 +633,8 @@ FILE_MANAGER_HTML = """
 
 @app.get("/ui", response_class=HTMLResponse)
 def file_manager_ui():
-    """文件管理 WebUI（使用 SANDBOX_TOKEN 鉴权）"""
     return FILE_MANAGER_HTML
 
-# 必须放在最后：挂载静态目录到 / 路径
-app.mount("/", StaticFiles(directory=STATIC_DIR), name="static")
 
+# 静态文件挂载（必须放最后）
+app.mount("/", StaticFiles(directory=WORKSPACE), name="static")
