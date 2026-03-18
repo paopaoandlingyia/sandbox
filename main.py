@@ -1,4 +1,3 @@
-import contextlib
 import json
 import os
 import shutil
@@ -180,13 +179,10 @@ def read_file(path: str) -> str:
 
 # ===================== FastAPI + MCP 挂载 =====================
 
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with contextlib.AsyncExitStack() as stack:
-        await stack.enter_async_context(mcp.session_manager.run())
-        yield
+# 创建 MCP ASGI 应用（path="/" 因为会挂载到 /mcp 下）
+mcp_app = mcp.http_app(path="/", stateless_http=True)
 
-app = FastAPI(title="AI Sandbox", lifespan=lifespan)
+app = FastAPI(title="AI Sandbox", lifespan=mcp_app.lifespan)
 
 
 # MCP 认证中间件：拦截 /mcp 路径的请求
@@ -201,7 +197,7 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(MCPAuthMiddleware)
 
 # 挂载 MCP Streamable HTTP 端点
-app.mount("/mcp", mcp.streamable_http_app(stateless=True))
+app.mount("/mcp", mcp_app)
 
 
 # ===================== REST API（机器人插件兼容）=====================
