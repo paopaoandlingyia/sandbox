@@ -9,8 +9,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastmcp import FastMCP
 from pydantic import BaseModel
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 
 # ===================== 配置 =====================
 
@@ -179,22 +177,27 @@ def read_file(path: str) -> str:
 
 # ===================== FastAPI + MCP 挂载 =====================
 
-# 创建 MCP ASGI 应用（path="/" 因为会挂载到 /mcp 下）
-mcp_app = mcp.http_app(path="/", stateless_http=True)
+# 用原生 ASGI 中间件包装 MCP 应用，实现 Token 认证
+# （BaseHTTPMiddleware 与 ASGI 子应用有兼容性问题，不能用）
+class MCPAuthMiddleware:
+    def __init__(self, app):
+        self.app = app
 
-app = FastAPI(title="AI Sandbox", lifespan=mcp_app.lifespan)
-
-
-# MCP 认证中间件：拦截 /mcp 路径的请求
-class MCPAuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path.startswith("/mcp"):
-            token = request.headers.get("x-sandbox-token")
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            token = headers.get(b"x-sandbox-token", b"").decode()
             if token != SANDBOX_TOKEN:
-                return JSONResponse(status_code=403, content={"detail": "Invalid X-Sandbox-Token"})
-        return await call_next(request)
+                response = JSONResponse(status_code=403, content={"detail": "Invalid X-Sandbox-Token"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
-app.add_middleware(MCPAuthMiddleware)
+# 创建 MCP ASGI 应用，用认证中间件包装
+raw_mcp_app = mcp.http_app(path="/", stateless_http=True)
+mcp_app = MCPAuthMiddleware(raw_mcp_app)
+
+app = FastAPI(title="AI Sandbox", lifespan=raw_mcp_app.lifespan)
 
 # 挂载 MCP Streamable HTTP 端点
 app.mount("/mcp", mcp_app)
