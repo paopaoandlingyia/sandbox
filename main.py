@@ -116,7 +116,6 @@ mcp = FastMCP(
         "你拥有完整的 Linux 环境权限，可以执行命令、运行代码、读写文件。"
         "工作目录为 /workspace。已预装 Python3、Node.js、常用系统工具。"
     ),
-    stateless_http=True,
 )
 
 
@@ -202,7 +201,7 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(MCPAuthMiddleware)
 
 # 挂载 MCP Streamable HTTP 端点
-app.mount("/mcp", mcp.streamable_http_app())
+app.mount("/mcp", mcp.streamable_http_app(stateless=True))
 
 
 # ===================== REST API（机器人插件兼容）=====================
