@@ -175,35 +175,9 @@ def read_file(path: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-# ===================== FastAPI + MCP 挂载 =====================
+# ===================== FastAPI（REST + WebUI）=====================
 
-# 用原生 ASGI 中间件包装 MCP 应用，实现 Token 认证
-# （BaseHTTPMiddleware 与 ASGI 子应用有兼容性问题，不能用）
-class MCPAuthMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers", []))
-            token = headers.get(b"x-sandbox-token", b"").decode()
-            if token != SANDBOX_TOKEN:
-                response = JSONResponse(status_code=403, content={"detail": "Invalid X-Sandbox-Token"})
-                await response(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-# 创建 MCP ASGI 应用，用认证中间件包装
-raw_mcp_app = mcp.http_app(path="/", stateless_http=True)
-mcp_app = MCPAuthMiddleware(raw_mcp_app)
-
-app = FastAPI(title="AI Sandbox", lifespan=raw_mcp_app.lifespan)
-
-# 挂载 MCP Streamable HTTP 端点
-app.mount("/mcp", mcp_app)
-
-
-# ===================== REST API（机器人插件兼容）=====================
+api = FastAPI(title="AI Sandbox")
 
 async def verify_token(x_sandbox_token: str = Header(None)):
     if x_sandbox_token != SANDBOX_TOKEN:
@@ -224,12 +198,12 @@ class RunCodeRequest(BaseModel):
     timeout: int = 30
 
 
-@app.get("/")
+@api.get("/")
 def read_root():
     return {"status": "online", "workspace": WORKSPACE, "auth_enabled": True, "mcp_endpoint": "/mcp"}
 
 
-@app.post("/execute", dependencies=[Depends(verify_token)])
+@api.post("/execute", dependencies=[Depends(verify_token)])
 def api_execute(req: ExecuteRequest):
     result = core_execute_command(req.command, req.timeout)
     if result["exit_code"] == -1 and "timed out" in result["stderr"]:
@@ -237,7 +211,7 @@ def api_execute(req: ExecuteRequest):
     return result
 
 
-@app.post("/run_code", dependencies=[Depends(verify_token)])
+@api.post("/run_code", dependencies=[Depends(verify_token)])
 def api_run_code(req: RunCodeRequest):
     result = core_run_code(req.language, req.code, req.timeout)
     if result["exit_code"] == -1 and "Unsupported language" in result["stderr"]:
@@ -247,7 +221,7 @@ def api_run_code(req: RunCodeRequest):
     return result
 
 
-@app.post("/write", dependencies=[Depends(verify_token)])
+@api.post("/write", dependencies=[Depends(verify_token)])
 def api_write_file(req: WriteFileRequest):
     result = core_write_file(req.path, req.content)
     if result["status"] == "error":
@@ -255,7 +229,7 @@ def api_write_file(req: WriteFileRequest):
     return result
 
 
-@app.get("/read", dependencies=[Depends(verify_token)])
+@api.get("/read", dependencies=[Depends(verify_token)])
 def api_read_file(path: str):
     result = core_read_file(path)
     if result.get("error"):
@@ -266,7 +240,7 @@ def api_read_file(path: str):
 
 # ===================== WebUI 专用端点 =====================
 
-@app.get("/list", dependencies=[Depends(verify_token)])
+@api.get("/list", dependencies=[Depends(verify_token)])
 def list_dir(path: str = "."):
     """列出目录内容"""
     try:
@@ -294,7 +268,7 @@ def list_dir(path: str = "."):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/delete", dependencies=[Depends(verify_token)])
+@api.delete("/delete", dependencies=[Depends(verify_token)])
 def delete_path(path: str):
     """删除文件或目录"""
     try:
@@ -312,7 +286,7 @@ def delete_path(path: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/upload", dependencies=[Depends(verify_token)])
+@api.post("/upload", dependencies=[Depends(verify_token)])
 async def upload_file(file: UploadFile = File(...), subdir: str = Form("")):
     """接收二进制文件上传"""
     try:
@@ -629,10 +603,43 @@ FILE_MANAGER_HTML = """
 </html>
 """
 
-@app.get("/ui", response_class=HTMLResponse)
+@api.get("/ui", response_class=HTMLResponse)
 def file_manager_ui():
     return FILE_MANAGER_HTML
 
 
-# 静态文件挂载（必须放最后）
-app.mount("/", StaticFiles(directory=WORKSPACE), name="static")
+# 静态文件挂载到 FastAPI
+api.mount("/", StaticFiles(directory=WORKSPACE), name="static")
+
+
+# ===================== 组合主应用 =====================
+# MCP app 做主应用，FastAPI 作为子路由嵌入
+# 这样 MCP 端点是直接的 Route("/mcp")，不存在 mount 路径匹配问题
+
+from starlette.routing import Mount
+
+raw_mcp_app = mcp.http_app(
+    path="/mcp",
+    stateless_http=True,
+    routes=[Mount("", app=api)],
+)
+
+
+# ASGI 中间件：仅对 /mcp 路径验证 Token
+class MCPAuthMiddleware:
+    def __init__(self, inner_app):
+        self.app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/mcp":
+            headers = dict(scope.get("headers", []))
+            token = headers.get(b"x-sandbox-token", b"").decode()
+            if token != SANDBOX_TOKEN:
+                resp = JSONResponse(status_code=403, content={"detail": "Invalid X-Sandbox-Token"})
+                await resp(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# 最终导出的 ASGI 应用（uvicorn main:app）
+app = MCPAuthMiddleware(raw_mcp_app)
