@@ -613,33 +613,31 @@ api.mount("/", StaticFiles(directory=WORKSPACE), name="static")
 
 
 # ===================== 组合主应用 =====================
-# MCP app 做主应用，FastAPI 作为子路由嵌入
-# 这样 MCP 端点是直接的 Route("/mcp")，不存在 mount 路径匹配问题
+# 不 mount、不嵌套，用 ASGI 分发器按路径把请求分给各自独立的 app
+# MCP app 和 FastAPI app 完全隔离，避免一切框架兼容性问题
 
-from starlette.routing import Mount
-
-raw_mcp_app = mcp.http_app(
-    path="/mcp",
-    stateless_http=True,
-    routes=[Mount("", app=api)],
-)
+mcp_starlette = mcp.http_app(path="/mcp", stateless_http=True)
 
 
-# ASGI 中间件：仅对 /mcp 路径验证 Token
-class MCPAuthMiddleware:
-    def __init__(self, inner_app):
-        self.app = inner_app
+class App:
+    """ASGI 路由分发器：/mcp → MCP，其他 → FastAPI"""
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] == "/mcp":
+        if scope["type"] == "lifespan":
+            await mcp_starlette(scope, receive, send)
+            return
+
+        if scope["type"] == "http" and scope["path"].startswith("/mcp"):
+            # MCP 端点鉴权
             headers = dict(scope.get("headers", []))
             token = headers.get(b"x-sandbox-token", b"").decode()
             if token != SANDBOX_TOKEN:
                 resp = JSONResponse(status_code=403, content={"detail": "Invalid X-Sandbox-Token"})
                 await resp(scope, receive, send)
                 return
-        await self.app(scope, receive, send)
+            await mcp_starlette(scope, receive, send)
+        else:
+            await api(scope, receive, send)
 
 
-# 最终导出的 ASGI 应用（uvicorn main:app）
-app = MCPAuthMiddleware(raw_mcp_app)
+app = App()
